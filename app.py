@@ -11,6 +11,7 @@ import os
 import time
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timedelta
+import traceback
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -20,9 +21,12 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 HISTORICAL_FILE = "historical_data.json"
 
-# 네이버 크롤링용 헤더
+# 네이버 크롤링용 헤더 (브라우저인 척 위장)
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Referer': 'https://www.naver.com/'
 }
 
 # ---------------------------------------------------------------------------
@@ -68,7 +72,7 @@ def save_historical_data(data):
         print(f"[ERROR] 데이터 저장 실패: {e}")
 
 # ---------------------------------------------------------------------------
-# 2. 네이버 크롤링 함수 (파싱 강화 - 선택자 추가)
+# 2. 네이버 크롤링 함수 (파싱 강화 - 선택자 대폭 추가)
 # ---------------------------------------------------------------------------
 
 def fetch_lotto_from_naver(round_no=None):
@@ -86,120 +90,117 @@ def fetch_lotto_from_naver(round_no=None):
         response = requests.get(url, headers=HEADERS, timeout=10, verify=False)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # [수정 1] 다양한 당첨 번호 컨테이너 선택자 시도
-        # .win_ball (구버전), .num_box, .win_number_box, .winning_number 등
-        win_ball_div = (
-            soup.select_one('.win_ball') or 
-            soup.select_one('.num_box') or 
-            soup.select_one('.win_number_box') or
-            soup.select_one('.winning_number') or
-            soup.select_one('.lotto_win_number') # 혹시 모를 클래스명
-        )
+        # [수정 1] 당첨 번호를 감싸는 컨테이너 후보군 (PC, 모바일, 구버전 대응)
+        candidates = [
+            '.win_number_box',  # 최신 PC 구조 (스크린샷 기반)
+            '.win_ball',        # 구버전 또는 내부 래퍼
+            '.num_box',         # 모바일 또는 다른 뷰
+            '.winning_number',  # 번호 직접 감싸는 태그
+            '.lotto_win_number',
+            '.win_result'       # 모바일 뷰
+        ]
         
-        bonus_ball_div = (
-            soup.select_one('.bonus_ball') or
-            soup.select_one('.bonus_number')
-        )
+        win_container = None
+        for selector in candidates:
+            found = soup.select_one(selector)
+            if found:
+                win_container = found
+                # print(f"[Crawler] 컨테이너 발견: {selector}") # 디버깅용
+                break
+        
+        # 컨테이너를 못 찾았으면 전체 래퍼라도 잡아서 시도
+        if not win_container:
+            win_container = soup.select_one('.lottery_wrap') or soup.select_one('.n_lotto') or soup.select_one('.cs_lotto')
 
-        if not win_ball_div:
-            # 컨테이너를 못 찾았을 경우, 전체 구조에서 'ball' 클래스나 숫자 형태를 직접 찾기 시도
-            # (최후의 수단: 특정 영역 안의 span들을 긁어옴)
-            print("[Crawler] 주요 컨테이너(.win_ball 등) 찾기 실패. 대체 탐색 시도...")
-            lotto_wrap = soup.select_one('.lottery_wrap') or soup.select_one('.n_lotto')
-            if lotto_wrap:
-                # 랩퍼 안의 모든 숫자 span을 찾음
-                pass # 아래 로직에서 처리
-            else:
-                print("[Crawler] 번호 영역을 찾지 못함")
-                return None
+        if not win_container:
+            print("[Crawler] HTML 구조 분석 실패 (번호 영역을 찾지 못함)")
+            return None
 
-        # [수정 2] 회차 추출 강화
+        # [수정 2] 회차 정보 추출 (유연하게)
         fetched_round = 0
-        lotto_wrap = soup.select_one('.lottery_wrap') or soup.select_one('.n_lotto') or soup.select_one('.cs_lotto') or soup.select_one('.lottery_grp')
+        title_area = soup.select_one('.lottery_wrap') or soup.select_one('.n_lotto') or soup.select_one('.cs_lotto') or soup
         
-        if lotto_wrap:
-             title_text = lotto_wrap.get_text()
-             # "1,161회" 또는 "1161회" 패턴 찾기
-             round_match = re.search(r'(\d{3,4}),?(\d*)회', title_text)
+        if title_area:
+             title_text = title_area.get_text()
+             # "1,211회", "1211회" 패턴 찾기
+             round_match = re.search(r'(\d{1,4}),?(\d{0,3})회', title_text)
              if round_match:
-                 # 콤마 제거 후 정수 변환
                  raw_str = round_match.group(1) + round_match.group(2)
                  fetched_round = int(raw_str)
              
+             # 파싱 실패했으나 텍스트에 요청 회차가 있다면 그걸로 간주 (Fallback)
              if fetched_round == 0 and round_no:
                  if f"{round_no}회" in title_text:
-                     print(f"[Crawler] 회차 파싱 실패했으나 텍스트에 '{round_no}회' 포함됨. 올바른 결과로 간주.")
+                     print(f"[Crawler] 회차 파싱 실패했으나 텍스트에 '{round_no}회' 확인됨.")
                      fetched_round = int(round_no)
         
-        # 회차 검증
+        # [중요] 회차 검증 로직 완화
+        # 검색 결과가 없거나(0), 요청한 회차와 다르면 문제. 
+        # 단, fetched_round가 0이어도 번호를 찾았다면 일단 진행.
         if round_no and fetched_round != 0 and fetched_round != int(round_no):
             print(f"[Crawler] 요청 회차({round_no})와 검색 결과({fetched_round}) 불일치. (최신 회차가 아직 업데이트 안 되었을 수 있음)")
             return None
 
-        # [수정 3] 번호 추출 로직 유연화
-        win_nums = []
+        # [수정 3] 번호 추출 (모든 span.ball 긁어오기 전략)
+        # 특정 클래스(.winning_number 등)에 얽매이지 않고, 숫자 볼 형태를 모두 수집
+        all_balls = win_container.select('span.ball')
         
-        # 방법 A: win_ball_div 안의 span.ball 찾기
-        if win_ball_div:
-            spans = win_ball_div.select('span.ball') or win_ball_div.select('span')
-            for span in spans:
-                txt = span.get_text(strip=True)
-                if txt.isdigit():
-                    win_nums.append(int(txt))
-        
-        # 방법 B: 만약 위에서 못 찾았다면 lotto_wrap 전체에서 찾기 (보너스 포함될 수 있음)
-        if len(win_nums) < 6 and lotto_wrap:
-            spans = lotto_wrap.select('span.ball')
-            temp_nums = []
-            for span in spans:
-                txt = span.get_text(strip=True)
-                if txt.isdigit():
-                    temp_nums.append(int(txt))
-            # 보통 6개+1개(보너스) 혹은 6개만 나옴
-            if len(temp_nums) >= 6:
-                win_nums = temp_nums
-
-        # 보너스 번호 추출
-        bonus_num = 0
-        if bonus_ball_div:
-             bonus_span = bonus_ball_div.select_one('span.ball') or bonus_ball_div.select_one('span')
-             if bonus_span:
-                 txt = bonus_span.get_text(strip=True)
-                 if txt.isdigit():
-                    bonus_num = int(txt)
-        
-        # 보너스 보정 (한 리스트 안에 다 있는 경우 분리)
-        # 예: [1, 2, 3, 4, 5, 6, 7] -> 7이 보너스
-        if len(win_nums) >= 7 and bonus_num == 0:
-             bonus_num = win_nums.pop()
-        elif len(win_nums) == 7 and bonus_num != 0:
-             # 이미 보너스를 찾았는데 win_nums에도 7개가 있다면 마지막꺼 제거 (중복 가능성)
-             if win_nums[-1] == bonus_num:
-                 win_nums.pop()
-
-        if len(win_nums) == 6 and bonus_num > 0:
-            # 회차 정보가 0이어도 번호가 확실하고 요청한 회차가 있다면 그걸로 간주
-            if fetched_round == 0 and round_no:
-                fetched_round = int(round_no)
+        # 만약 span.ball이 없으면 그냥 span만 찾아서 숫자 필터링
+        if not all_balls:
+            all_balls = win_container.select('span')
             
-            # 최종 확인: 요청한 회차가 0(자동 최신)이거나, 추출된 회차와 같거나, 추출실패(0)시
-            if not round_no or (fetched_round == int(round_no)) or fetched_round == 0:
-                print(f"[Crawler] {fetched_round if fetched_round else '최신'}회 데이터 확보 성공: {win_nums} + {bonus_num}")
-                return {
-                    "round": fetched_round if fetched_round else int(round_no if round_no else 0),
-                    "winning_numbers": sorted(win_nums),
-                    "bonus": bonus_num
-                }
-            else:
-                print("[Crawler] 번호 추출 성공했으나 회차 불일치")
+        extracted_nums = []
+        for ball in all_balls:
+            txt = ball.get_text(strip=True)
+            if txt.isdigit():
+                num = int(txt)
+                if 1 <= num <= 45: # 로또 번호 범위 체크
+                    extracted_nums.append(num)
+        
+        # 중복 제거 없이 순서대로 수집 (보통 당첨번호 6개 + 보너스 1개 순서로 나옴)
+        # 네이버 구조상 당첨번호 6개는 앞에서 나오고 보너스는 뒤에 나옴
+        
+        if len(extracted_nums) >= 7:
+            # 보통 7개 이상 나오면 앞 6개가 당첨, 마지막이나 특정 위치가 보너스
+            # 중복된 숫자가 나올 수도 있으므로 (HTML 구조상) 유니크하게 처리하지 않고 흐름대로
+            
+            # 마지막 숫자를 보너스로 간주 (네이버 UI상 맨 뒤에 보너스 위치)
+            bonus_num = extracted_nums[-1]
+            win_nums = extracted_nums[:6]
+            
+            # 검증: 번호가 6개인지
+            if len(set(win_nums)) < 6:
+                # 중복 등으로 개수가 모자라면 다시 정제
+                win_nums = list(dict.fromkeys(extracted_nums))[:6] # 순서 유지 중복 제거
+                if len(extracted_nums) > 6:
+                    bonus_num = extracted_nums[-1]
+
+            # 최종 회차 결정 (파싱 실패시 요청 회차 사용)
+            final_round = fetched_round if fetched_round != 0 else int(round_no if round_no else 0)
+            
+            if final_round == 0:
+                print("[Crawler] 번호는 찾았으나 회차 정보를 확정할 수 없음.")
+                # 최신 회차를 요청한 경우가 아니면 저장하지 않음 (오류 방지)
+                if not round_no:
+                    # 최신 회차 계산해서 할당
+                    final_round = calculate_expected_round()
+                    # 만약 토요일 저녁이라 아직 안나왔을 수도 있으니 주의. 
+                    # 하지만 데이터가 있다는건 나왔다는 뜻.
+
+            print(f"[Crawler] {final_round}회 데이터 확보 성공: {win_nums} + {bonus_num}")
+            return {
+                "round": final_round,
+                "winning_numbers": sorted(list(set(win_nums))), # 정렬 및 중복 확실히 제거
+                "bonus": bonus_num
+            }
 
         else:
-            print(f"[Crawler] 번호 추출 실패. 추출된 개수: {len(win_nums)}, 보너스: {bonus_num}")
+            print(f"[Crawler] 번호 개수 부족. 추출된 숫자: {extracted_nums}")
+            return None
             
     except Exception as e:
         print(f"[ERROR] 크롤링 실패: {e}")
-        import traceback
-        traceback.print_exc()
+        traceback.print_exc() # 상세 에러 로그 출력
         
     return None
 
@@ -215,10 +216,6 @@ def ensure_latest_data():
         
     expected = calculate_expected_round()
     
-    # [안전장치] 만약 토요일 오후 8시 40분 이전이라면 아직 추첨 전이므로 expected를 1 줄임
-    # 하지만 calculate_expected_round 로직상 날짜 기준이라 하루 정도 오차는 괜찮음
-    # (일요일에 실행하면 문제 없음)
-    
     if expected > last_saved:
         print(f"[Update] 최신 데이터 업데이트 필요 (저장됨: {last_saved}회 / 예상: {expected}회)")
         
@@ -227,7 +224,7 @@ def ensure_latest_data():
         for r in range(last_saved + 1, expected + 1):
             data = fetch_lotto_from_naver(r)
             if data:
-                # 중복 방지 (이미 있는지 확인)
+                # 중복 방지
                 if not any(d['round'] == data['round'] for d in history):
                     history.append(data)
                     updated_count += 1
